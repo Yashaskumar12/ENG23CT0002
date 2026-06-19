@@ -2,7 +2,6 @@ const express = require('express');
 
 const app = express();
 
-// Mock data - simulating the response from the notification API
 const mockNotifications = {
   '1042': [
     {
@@ -88,7 +87,6 @@ const mockNotifications = {
   ]
 };
 
-// Route 1: Check authorization
 app.get('/evaluation-service/notifications', (req, res) => {
   const authHeader = req.get('authorization');
   
@@ -111,7 +109,6 @@ app.get('/evaluation-service/notifications', (req, res) => {
   res.json(notifications);
 });
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Mock API server running' });
 });

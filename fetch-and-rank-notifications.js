@@ -1,58 +1,55 @@
 const axios = require('axios');
 
-// Use mock API for demo purposes
-// To use the real API: change USE_MOCK_API to false and provide AUTHORIZATION_TOKEN
-const USE_MOCK_API = true;
-const MOCK_API_URL = 'http://localhost:4000/evaluation-service/notifications';
-const REAL_API_URL = 'http://4.224.186.213/evaluation-service/notifications';
-const AUTHORIZATION_TOKEN = process.env.API_TOKEN || 'Bearer YOUR_TOKEN_HERE';
+const ENABLE_LOCAL_MOCK = true;
+const LOCAL_ENDPOINT = 'http://localhost:4000/evaluation-service/notifications';
+const PROD_ENDPOINT = 'http://4.224.186.213/evaluation-service/notifications';
+const AUTH_BEARER = process.env.API_TOKEN || 'Bearer YOUR_TOKEN_HERE';
 
-const API_URL = USE_MOCK_API ? MOCK_API_URL : REAL_API_URL;
+const SELECTED_URL = ENABLE_LOCAL_MOCK ? LOCAL_ENDPOINT : PROD_ENDPOINT;
 
-const TYPE_WEIGHTS = {
+const IMPORTANCE_WEIGHTS = {
   'Placement': 100,
   'Result': 50,
   'Event': 10
 };
 
-function calculateAge(createdAt) {
-  const now = new Date();
-  const created = new Date(createdAt);
-  const diffMs = now.getTime() - created.getTime();
-  return diffMs / (1000 * 60 * 60);
+function computeElapsedHours(timestamp) {
+  const current = new Date();
+  const original = new Date(timestamp);
+  const msElapsed = current.getTime() - original.getTime();
+  return msElapsed / (1000 * 60 * 60);
 }
 
-function calculateScore(notification) {
-  const weight = TYPE_WEIGHTS[notification.type] || 0;
-  const ageHours = calculateAge(notification.createdAt);
-  const recencyFactor = Math.max(0, 1 - (ageHours / 168));
-  return weight * recencyFactor;
+function computeImportanceScore(notification) {
+  const importance = IMPORTANCE_WEIGHTS[notification.type] || 0;
+  const hoursOld = computeElapsedHours(notification.createdAt);
+  const decayFactor = Math.max(0, 1 - (hoursOld / 168));
+  return importance * decayFactor;
 }
 
-async function fetchNotificationsFromAPI(studentId) {
+async function retrieveNotificationsFromService(userId) {
   try {
-    console.log(`📥 Fetching from: ${API_URL}?studentId=${studentId}`);
+    console.log(`📥 Fetching from: ${SELECTED_URL}?studentId=${userId}`);
     
-    const config = {
+    const requestConfig = {
       params: {
-        studentId: studentId
+        studentId: userId
       },
       timeout: 5000
     };
     
-    // Add authorization header
-    if (!USE_MOCK_API) {
-      config.headers = {
-        'Authorization': AUTHORIZATION_TOKEN
+    if (!ENABLE_LOCAL_MOCK) {
+      requestConfig.headers = {
+        'Authorization': AUTH_BEARER
       };
-      console.log(`   Using Authorization Header: ${AUTHORIZATION_TOKEN.substring(0, 20)}...`);
+      console.log(`   Using Authorization Header: ${AUTH_BEARER.substring(0, 20)}...`);
     } else {
-      config.headers = {
+      requestConfig.headers = {
         'Authorization': 'Bearer mock-token-for-demo'
       };
     }
     
-    const response = await axios.get(API_URL, config);
+    const response = await axios.get(SELECTED_URL, requestConfig);
     
     console.log(`✓ Retrieved ${response.data.length || 0} notifications\n`);
     return response.data || [];
@@ -62,7 +59,7 @@ async function fetchNotificationsFromAPI(studentId) {
       console.error(`\n💡 HINT: The API requires an Authorization header!`);
       console.error(`   Set your token: export API_TOKEN="Bearer YOUR_TOKEN_HERE"`);
     } else if (error.code === 'ECONNREFUSED') {
-      console.error(`❌ Connection Error: Cannot reach ${API_URL}`);
+      console.error(`❌ Connection Error: Cannot reach ${SELECTED_URL}`);
       console.error(`\n💡 HINT: To use mock data for testing:`);
       console.error(`   1. Start mock server: node mock-api-server.js`);
       console.error(`   2. Run this script: node fetch-and-rank-notifications.js`);
@@ -73,64 +70,64 @@ async function fetchNotificationsFromAPI(studentId) {
   }
 }
 
-function getPriorityInbox(notifications, limit = 10) {
-  const unreadNotifications = notifications.filter(n => !n.isRead);
+function extractTopByImportance(notifications, maxCount = 10) {
+  const unreadOnly = notifications.filter(n => !n.isRead);
   
-  const scoredNotifications = unreadNotifications.map(notif => ({
+  const withScores = unreadOnly.map(notif => ({
     ...notif,
-    score: calculateScore(notif),
-    weight: TYPE_WEIGHTS[notif.type] || 0,
-    ageHours: calculateAge(notif.createdAt)
+    importanceScore: computeImportanceScore(notif),
+    importance: IMPORTANCE_WEIGHTS[notif.type] || 0,
+    hoursOld: computeElapsedHours(notif.createdAt)
   }));
   
-  scoredNotifications.sort((a, b) => {
-    if (b.score !== a.score) {
-      return b.score - a.score;
+  withScores.sort((a, b) => {
+    if (b.importanceScore !== a.importanceScore) {
+      return b.importanceScore - a.importanceScore;
     }
     return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
   });
   
-  return scoredNotifications.slice(0, limit);
+  return withScores.slice(0, maxCount);
 }
 
-async function displayPriorityInbox(studentId, limit = 10) {
+async function renderPriorityInbox(userId, maxCount = 10) {
   console.log('\n' + '='.repeat(70));
   console.log('NOTIFICATION PRIORITY INBOX - Using External API');
   console.log('='.repeat(70) + '\n');
   
-  const notifications = await fetchNotificationsFromAPI(studentId);
+  const allNotifications = await retrieveNotificationsFromService(userId);
   
-  if (notifications.length === 0) {
+  if (allNotifications.length === 0) {
     console.log('No notifications found for this student.\n');
     return;
   }
   
-  const topNotifications = getPriorityInbox(notifications, limit);
+  const priorityList = extractTopByImportance(allNotifications, maxCount);
   
-  const unreadCount = notifications.filter(n => !n.isRead).length;
+  const unreadTotal = allNotifications.filter(n => !n.isRead).length;
   
   console.log(`📊 Summary:`);
-  console.log(`   Total Notifications: ${notifications.length}`);
-  console.log(`   Unread: ${unreadCount}`);
-  console.log(`   Top Displayed: ${topNotifications.length}\n`);
+  console.log(`   Total Notifications: ${allNotifications.length}`);
+  console.log(`   Unread: ${unreadTotal}`);
+  console.log(`   Top Displayed: ${priorityList.length}\n`);
   
   console.log('Priority Weights: Placement=100, Result=50, Event=10');
   console.log('Formula: Score = Weight × (1 - Age_Hours/168)\n');
   console.log('-'.repeat(70) + '\n');
   
-  const typeEmoji = {
+  const iconMap = {
     'Placement': '💼',
     'Result': '📊',
     'Event': '📢'
   };
   
-  topNotifications.forEach((notif, index) => {
-    const emoji = typeEmoji[notif.type] || '📌';
+  priorityList.forEach((notif, idx) => {
+    const icon = iconMap[notif.type] || '📌';
     
-    console.log(`${index + 1}. ${emoji} [${notif.type}] ${notif.title}`);
-    console.log(`   Weight: ${notif.weight} | Score: ${notif.score.toFixed(3)}`);
+    console.log(`${idx + 1}. ${icon} [${notif.type}] ${notif.title}`);
+    console.log(`   Weight: ${notif.importance} | Score: ${notif.importanceScore.toFixed(3)}`);
     console.log(`   Message: ${notif.message}`);
-    console.log(`   Age: ${notif.ageHours.toFixed(1)} hours`);
+    console.log(`   Age: ${notif.hoursOld.toFixed(1)} hours`);
     console.log(`   Created: ${notif.createdAt}`);
     console.log(`   Read: ${notif.isRead ? 'Yes' : 'No'}`);
     console.log();
@@ -140,13 +137,13 @@ async function displayPriorityInbox(studentId, limit = 10) {
 }
 
 async function main() {
-  const studentIds = ['1042'];
+  const userIds = ['1042'];
   
-  for (const studentId of studentIds) {
+  for (const userId of userIds) {
     try {
-      await displayPriorityInbox(studentId, 10);
+      await renderPriorityInbox(userId, 10);
     } catch (error) {
-      console.error(`Error processing student ${studentId}:`, error.message);
+      console.error(`Error processing user ${userId}:`, error.message);
     }
   }
 }
