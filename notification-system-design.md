@@ -610,3 +610,327 @@ WHERE user_id = $1
 ORDER BY created_at DESC 
 LIMIT 10;
 ```
+
+---
+
+## Stage 3
+
+### Query Analysis and Optimization
+
+**Original Query:**
+```sql
+SELECT * FROM notifications 
+WHERE student_id = 1042 AND is_read = false 
+ORDER BY created_at DESC;
+```
+
+**Context:** Database with 50,000 students and 5,000,000 notifications.
+
+### Is This Query Accurate?
+
+**Yes**, the query is functionally accurate. It correctly retrieves all unread notifications for student 1042 ordered by most recent first. However, accuracy alone doesn't address performance issues.
+
+### Why Is This Query Slow?
+
+**Primary Issues:**
+
+1. **Missing Indexes:** Without indexes on `student_id` and `is_read`, the database performs a full table scan across 5,000,000 rows for every query.
+
+2. **SELECT * (Anti-pattern):** Fetching all columns including large text fields (metadata, message) when only essential fields are needed increases I/O.
+
+3. **No Composite Index:** The query filters on two columns (`student_id` AND `is_read`). A composite index would be more efficient than individual indexes.
+
+4. **Database Scans:** With 5M rows, even with indexes, performance degrades due to the sheer volume of unread notifications per student.
+
+**Estimated Performance:**
+- Full table scan: ~500ms - 2 seconds
+- With proper indexes: ~10-50ms
+
+### Optimized Query
+
+```sql
+SELECT id, student_id, title, message, type, priority, created_at, action_url 
+FROM notifications 
+WHERE student_id = $1 AND is_read = FALSE AND deleted_at IS NULL 
+ORDER BY created_at DESC 
+LIMIT 20;
+```
+
+### Changes and Computation Cost
+
+**Changes Made:**
+
+| Change | Impact | Computation Cost |
+|--------|--------|------------------|
+| Add composite index on (student_id, is_read, created_at) | Enables index-based filtering and sorting | O(log n) lookup instead of O(n) full scan |
+| Use SELECT specific columns instead of SELECT * | Reduces data transfer overhead | 70-80% reduction in data fetched |
+| Add LIMIT clause | Prevents loading entire result set | Dramatically reduces memory usage |
+| Add deleted_at IS NULL filter | Enables soft delete consistency | Negligible with proper indexing |
+
+**Computation Costs (Estimated):**
+- Full table scan (original): O(n) = ~2 seconds for 5M rows
+- With composite index (optimized): O(log n) = ~10-50ms
+
+### Index Strategy Evaluation
+
+**Suggestion: "Add indexes on every column"**
+
+**Is this effective? NO**
+
+**Why?**
+- Creates excessive index overhead (5-7x storage increase)
+- Slows down INSERT/UPDATE operations (index maintenance cost)
+- Query planner becomes confused with too many index choices
+- Most columns are rarely used in WHERE clauses
+
+**Effective Index Strategy:**
+
+1. **Composite Index (Primary):**
+   ```sql
+   CREATE INDEX idx_student_unread_created 
+   ON notifications(student_id, is_read DESC, created_at DESC)
+   WHERE deleted_at IS NULL;
+   ```
+
+2. **Type + Priority Index (Secondary):**
+   ```sql
+   CREATE INDEX idx_student_type_priority 
+   ON notifications(student_id, notification_type, priority, created_at DESC)
+   WHERE deleted_at IS NULL AND is_read = FALSE;
+   ```
+
+3. **Avoid:**
+   - Individual indexes on low-cardinality columns (is_read has only 2 values)
+   - Indexes on columns never used in WHERE/ORDER BY/JOIN clauses
+
+### Query to Find Students with Placement Notifications (Last 7 Days)
+
+**Requirement:** Find all students who got a placement notification in the last 7 days.
+
+**Notification Types:** "Event", "Result", "Placement"
+
+```sql
+SELECT DISTINCT n.student_id, u.name, u.email
+FROM notifications n
+INNER JOIN users u ON n.student_id = u.id
+WHERE n.notification_type = 'Placement'
+  AND n.created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+  AND n.deleted_at IS NULL
+ORDER BY n.created_at DESC;
+```
+
+**Alternative: With Notification Details**
+
+```sql
+SELECT DISTINCT 
+  n.student_id, 
+  u.name, 
+  u.email,
+  n.id as notification_id,
+  n.title,
+  n.message,
+  n.created_at
+FROM notifications n
+INNER JOIN users u ON n.student_id = u.id
+WHERE n.notification_type = 'Placement'
+  AND n.created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+  AND n.deleted_at IS NULL
+ORDER BY n.student_id, n.created_at DESC;
+```
+
+**Alternative: Count Placement Notifications per Student**
+
+```sql
+SELECT 
+  n.student_id,
+  u.name,
+  u.email,
+  COUNT(n.id) as placement_notification_count,
+  MAX(n.created_at) as latest_notification
+FROM notifications n
+INNER JOIN users u ON n.student_id = u.id
+WHERE n.notification_type = 'Placement'
+  AND n.created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+  AND n.deleted_at IS NULL
+GROUP BY n.student_id, u.name, u.email
+ORDER BY COUNT(n.id) DESC;
+```
+
+---
+
+## Stage 4
+
+### Performance Optimization Strategies
+
+**Problem:** Notifications are fetched on every page load for every student. The database is overwhelmed, causing degraded user experience.
+
+### Solution 1: Redis Caching Layer
+
+**Implementation:**
+
+Cache unread notification metadata in Redis with TTL.
+
+```sql
+CACHE_KEY = "user:{student_id}:unread_notifications"
+CACHE_TTL = 300 seconds (5 minutes)
+
+On request:
+1. Check Redis cache
+2. If hit, return cached data
+3. If miss, query database and cache result
+4. On notification creation/update, invalidate cache
+```
+
+**Tradeoffs:**
+- **Pros:** Eliminates repeated database queries, reduces load by 80-90%
+- **Cons:** Slight data staleness (5-min delay), additional infrastructure needed, cache invalidation complexity
+
+**Computation Cost:** O(1) lookup vs O(log n) database query
+
+---
+
+### Solution 2: Database Connection Pooling & Read Replicas
+
+**Implementation:**
+
+Use PgBouncer for connection pooling and configure read replicas for read operations.
+
+```
+Primary Database (Writes)
+  ↓ (Replication)
+Read Replica 1, Replica 2, Replica 3
+  ↑
+PgBouncer (Connection Pool)
+  ↑
+Application Servers
+```
+
+**Tradeoffs:**
+- **Pros:** Scales read operations horizontally, reduces connection overhead, improves concurrent user handling
+- **Cons:** Replication lag (eventual consistency), increased infrastructure cost, adds operational complexity
+
+**Computation Cost:** Reduces concurrent query bottleneck from 1 to N servers
+
+---
+
+### Solution 3: Notification Pagination with Lazy Loading
+
+**Implementation:**
+
+Fetch notifications in batches instead of all at once. Load more on user scroll.
+
+```javascript
+Initial Load: Fetch 10 recent notifications
+Scroll Event: Fetch next 10
+API: GET /api/v1/notifications?student_id=1042&limit=10&offset=0
+```
+
+**Tradeoffs:**
+- **Pros:** Reduces initial load time, improves perceived performance, lower memory usage
+- **Cons:** Multiple API calls required, requires frontend logic changes, slightly delayed access to older notifications
+
+**Computation Cost:** O(log n) per batch instead of O(n) for all
+
+---
+
+### Solution 4: Message Queue (Kafka/RabbitMQ) with Asynchronous Notification Processing
+
+**Implementation:**
+
+Decouple notification fetching from page load using async processing.
+
+```
+User Action → Enqueue Fetch Job → Return Immediately (200 OK)
+Worker Pool → Process Fetch Job → Store in Cache
+WebSocket/Poll → Client Receives Notifications
+```
+
+**Tradeoffs:**
+- **Pros:** Page load no longer blocked by notification query, better scalability, resilient to database slowdowns
+- **Cons:** Increased architectural complexity, data not immediately available, requires message broker, eventual consistency model
+
+**Computation Cost:** Distributes load across worker pool
+
+---
+
+### Solution 5: Database Partitioning (Time-Based)
+
+**Implementation:**
+
+Partition notifications table by creation date. Queries scan only relevant partitions.
+
+```sql
+CREATE TABLE notifications_2026_q2 PARTITION OF notifications
+  FOR VALUES FROM ('2026-04-01') TO ('2026-07-01');
+
+CREATE TABLE notifications_2026_q1 PARTITION OF notifications
+  FOR VALUES FROM ('2026-01-01') TO ('2026-04-01');
+```
+
+**Tradeoffs:**
+- **Pros:** Faster queries on recent data (where most queries occur), easier archiving/deletion of old data, better index performance
+- **Cons:** Complex maintenance, increased operational overhead, limited to time-based access patterns
+
+**Computation Cost:** O(log n) on partition subset instead of full table
+
+---
+
+### Solution 6: Pre-computed Notification Count Cache
+
+**Implementation:**
+
+Maintain a separate table with precomputed unread counts per student, updated asynchronously.
+
+```sql
+CREATE TABLE notification_count_cache (
+  student_id VARCHAR(255) PRIMARY KEY,
+  unread_count INT,
+  last_updated TIMESTAMP,
+  FOREIGN KEY (student_id) REFERENCES users(id)
+);
+
+UPDATE notification_count_cache
+SET unread_count = (
+  SELECT COUNT(*) FROM notifications 
+  WHERE student_id = $1 AND is_read = FALSE
+),
+last_updated = CURRENT_TIMESTAMP
+WHERE student_id = $1;
+```
+
+**Tradeoffs:**
+- **Pros:** O(1) count queries, eliminates expensive COUNT operations, very fast for count-only requests
+- **Cons:** Additional table maintenance overhead, stale counts possible, extra storage needed
+
+**Computation Cost:** O(1) vs O(n) COUNT operation
+
+---
+
+### Recommended Architecture (Hybrid Approach)
+
+For the Campus Evaluation system with 50,000 students:
+
+1. **Immediate (High Priority):**
+   - Implement Redis caching for unread notification counts (5-min TTL)
+   - Add composite index: (student_id, is_read, created_at)
+   - Implement pagination with limit=10, load more on scroll
+
+2. **Short-term (1-2 weeks):**
+   - Set up read replicas for database
+   - Implement PgBouncer connection pooling
+   - Add application-level request batching
+
+3. **Medium-term (1-2 months):**
+   - Implement database partitioning by date
+   - Add pre-computed count cache table
+   - Set up monitoring/alerting for slow queries
+
+4. **Long-term (Infrastructure):**
+   - Evaluate message queue for true async processing
+   - Consider ElasticSearch for full-text notification search
+   - Implement CDN for static notification templates
+
+**Expected Performance Improvements:**
+- Initial page load: 2-3s → 200-300ms (10x improvement)
+- Database CPU: 85% → 15% (5.6x reduction)
+- Concurrent users supported: 100 → 1000+
