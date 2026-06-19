@@ -934,3 +934,537 @@ For the Campus Evaluation system with 50,000 students:
 - Initial page load: 2-3s → 200-300ms (10x improvement)
 - Database CPU: 85% → 15% (5.6x reduction)
 - Concurrent users supported: 100 → 1000+
+
+---
+
+## Stage 5
+
+### Bulk Notification Distribution - Reliability & Architecture
+
+**Scenario:** Placement season - HR clicks "Notify All" to send email and in-app notifications to 50,000 students simultaneously.
+
+**Problem with Naive Implementation:**
+
+```
+function notify_all(student_ids, message):
+  for student_id in student_ids:
+    send_email(student_id, message)
+    save_to_db(student_id, message)
+    push_to_app(student_id, message)
+```
+
+**Shortcomings:**
+
+1. **No Fault Tolerance:** If `send_email` fails at student #200, the process stops. Students #201-50,000 don't get notified.
+
+2. **No Retry Logic:** Failed operations (temporary network errors) are lost permanently. No automatic recovery.
+
+3. **Synchronous Blocking:** All 50,000 students must wait sequentially. With ~500ms per student, total time = ~6-7 hours.
+
+4. **Partial Failure Risk:** Email service crashes midway, leaving inconsistent state (DB has records, but emails never sent).
+
+5. **Single Point of Failure:** If the entire process crashes, no way to resume from checkpoint. Must restart manually.
+
+6. **No Transaction Support:** DB and email are separate operations. Email succeeds but DB insert fails (or vice versa), creating data inconsistency.
+
+7. **No Monitoring/Alerting:** No visibility into which students succeeded/failed. No metrics to track success rate.
+
+### Redesigned Architecture - Reliable & Fast
+
+**Solution: Asynchronous Processing with Message Queue**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ User clicks "Notify All"                                    │
+└──────────────────┬──────────────────────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────┐
+│ Create Notification Job              │
+│ - Save to database with PENDING      │
+│ - Return 202 Accepted (async)        │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼
+         ┌─────────────────┐
+         │  Message Queue  │
+         │   (RabbitMQ)    │
+         └────────┬────────┘
+                  │
+      ┌───────────┼───────────┐
+      │           │           │
+      ▼           ▼           ▼
+  Worker 1   Worker 2   Worker 3
+  (100 tasks) (100 tasks) (50 tasks)
+  ┌─────────┬──────────┬───────────┐
+  │ Send    │ Save to  │ Push to   │
+  │ Email   │ DB       │ App       │
+  │ + Retry │ + Atomic │ + Retry   │
+  └────┬────┴──────────┴─────┬─────┘
+       │                     │
+       └─────────┬───────────┘
+                 │
+         ┌───────▼────────┐
+         │ Update Status  │
+         │ (Success/Fail) │
+         └────────────────┘
+```
+
+**Key Design Principles:**
+
+1. **Idempotent Operations:** Each notification send includes a unique ID. If a retry happens, the system detects it's duplicate and skips.
+
+2. **Atomic Database Operations:** Email and DB save happen together in a transaction, or both rollback. No partial states.
+
+3. **Automatic Retry with Exponential Backoff:**
+   - Retry 1: Wait 5 seconds
+   - Retry 2: Wait 25 seconds
+   - Retry 3: Wait 125 seconds
+   - Max 3 retries, then mark as failed
+
+4. **Distributed Processing:** Multiple workers process notifications in parallel (10-50x speedup).
+
+5. **Persistent State:** Every step is logged. If system crashes, resume from last checkpoint.
+
+6. **Dead Letter Queue:** Failed tasks (after retries) go to DLQ for manual review.
+
+### Implementation Pseudocode
+
+```javascript
+function initiateBulkNotification(studentIds, message) {
+  const jobId = generateUniqueId();
+  
+  saveJobToDB({
+    id: jobId,
+    status: "INITIATED",
+    totalCount: studentIds.length,
+    processedCount: 0,
+    failedCount: 0,
+    createdAt: now()
+  });
+  
+  enqueueJob({
+    jobId: jobId,
+    studentIds: studentIds,
+    message: message
+  });
+  
+  return {
+    jobId: jobId,
+    status: "ACCEPTED",
+    message: "Notifications will be sent shortly"
+  };
+}
+
+function processNotificationJob(jobId, studentIds, message) {
+  for (const studentId of studentIds) {
+    const notificationId = generateUniqueId();
+    
+    enqueueTask({
+      jobId: jobId,
+      notificationId: notificationId,
+      studentId: studentId,
+      message: message,
+      retryCount: 0,
+      maxRetries: 3,
+      lastError: null
+    });
+  }
+  
+  updateJobStatus(jobId, "QUEUED");
+}
+
+function sendNotificationToStudent(task) {
+  try {
+    const transaction = beginTransaction();
+    
+    try {
+      saveNotificationToDB({
+        id: task.notificationId,
+        studentId: task.studentId,
+        message: task.message,
+        sentViaEmail: false,
+        sentViaApp: false,
+        createdAt: now()
+      }, transaction);
+      
+      sendEmail(task.studentId, task.message);
+      
+      updateNotificationDB({
+        id: task.notificationId,
+        sentViaEmail: true
+      }, transaction);
+      
+      pushToApp(task.studentId, task.message);
+      
+      updateNotificationDB({
+        id: task.notificationId,
+        sentViaApp: true
+      }, transaction);
+      
+      transaction.commit();
+      
+      updateJobProgress(task.jobId, "SUCCESS");
+      
+    } catch (error) {
+      transaction.rollback();
+      throw error;
+    }
+    
+  } catch (error) {
+    if (task.retryCount < task.maxRetries) {
+      task.retryCount++;
+      task.lastError = error.message;
+      
+      const delay = calculateBackoff(task.retryCount);
+      requeueTask(task, delay);
+      
+    } else {
+      updateJobProgress(task.jobId, "FAILED");
+      sendToDeadLetterQueue({
+        task: task,
+        finalError: error.message,
+        attempts: task.retryCount
+      });
+      
+      alertAdministrator({
+        jobId: task.jobId,
+        studentId: task.studentId,
+        reason: "Max retries exceeded"
+      });
+    }
+  }
+}
+
+function calculateBackoff(retryCount) {
+  const baseDelay = 5000;
+  return baseDelay * Math.pow(5, retryCount - 1);
+}
+```
+
+### Key Improvements
+
+| Aspect | Naive | Improved |
+|--------|-------|----------|
+| **Time to send 50k** | 6-7 hours (sequential) | 10-15 minutes (parallel) |
+| **Fault tolerance** | Single failure = restart | Auto-retry with backoff |
+| **Consistency** | Partial states possible | Atomic (all or nothing) |
+| **Visibility** | None | Full audit trail & metrics |
+| **Scalability** | Limited to 1 server | Distributes across workers |
+| **Data integrity** | Lost if crash | Recoverable from DB |
+
+### Database Changes
+
+```sql
+CREATE TABLE notification_jobs (
+  id VARCHAR(255) PRIMARY KEY,
+  status VARCHAR(50) NOT NULL,
+  total_count INT NOT NULL,
+  processed_count INT DEFAULT 0,
+  successful_count INT DEFAULT 0,
+  failed_count INT DEFAULT 0,
+  started_at TIMESTAMP,
+  completed_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE notification_tasks (
+  id VARCHAR(255) PRIMARY KEY,
+  job_id VARCHAR(255) NOT NULL,
+  student_id VARCHAR(255) NOT NULL,
+  status VARCHAR(50) NOT NULL,
+  retry_count INT DEFAULT 0,
+  last_error TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (job_id) REFERENCES notification_jobs(id)
+);
+
+CREATE TABLE notification_dead_letter_queue (
+  id VARCHAR(255) PRIMARY KEY,
+  task_id VARCHAR(255) NOT NULL,
+  job_id VARCHAR(255) NOT NULL,
+  student_id VARCHAR(255) NOT NULL,
+  final_error TEXT,
+  total_attempts INT,
+  queued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+---
+
+## Stage 6
+
+### Priority Inbox Implementation
+
+**Requirement:** Display top 10 most important unread notifications based on weight and recency.
+
+**Priority Formula:**
+- **Placement:** Weight = 100
+- **Result:** Weight = 50
+- **Event:** Weight = 10
+
+**Recency Score:** Score decreases over time (recent notifications score higher)
+
+**Overall Score = Type Weight × (1 - (Age in Hours / 168))**
+
+The notification API endpoint: `http://4.224.186.213/evaluation-service/notifications`
+
+### Implementation (TypeScript)
+
+```typescript
+import axios from 'axios';
+
+interface Notification {
+  id: string;
+  title: string;
+  message: string;
+  type: 'Placement' | 'Result' | 'Event';
+  createdAt: string;
+  isRead: boolean;
+}
+
+interface ScoredNotification extends Notification {
+  score: number;
+  ageHours: number;
+}
+
+const TYPE_WEIGHTS: Record<string, number> = {
+  'Placement': 100,
+  'Result': 50,
+  'Event': 10
+};
+
+function calculateAge(createdAt: string): number {
+  const now = new Date();
+  const created = new Date(createdAt);
+  const diffMs = now.getTime() - created.getTime();
+  return diffMs / (1000 * 60 * 60);
+}
+
+function calculateScore(notification: Notification): number {
+  const weight = TYPE_WEIGHTS[notification.type] || 0;
+  const ageHours = calculateAge(notification.createdAt);
+  
+  const recencyFactor = Math.max(0, 1 - (ageHours / 168));
+  
+  return weight * recencyFactor;
+}
+
+async function getTopNotifications(
+  studentId: string,
+  limit: number = 10
+): Promise<ScoredNotification[]> {
+  const apiUrl = 'http://4.224.186.213/evaluation-service/notifications';
+  
+  const response = await axios.get(apiUrl, {
+    params: {
+      studentId: studentId
+    }
+  });
+  
+  const notifications: Notification[] = response.data;
+  
+  const unreadNotifications = notifications.filter(n => !n.isRead);
+  
+  const scoredNotifications: ScoredNotification[] = unreadNotifications.map(notif => ({
+    ...notif,
+    score: calculateScore(notif),
+    ageHours: calculateAge(notif.createdAt)
+  }));
+  
+  scoredNotifications.sort((a, b) => b.score - a.score);
+  
+  return scoredNotifications.slice(0, limit);
+}
+
+function formatNotificationForDisplay(notification: ScoredNotification): string {
+  return `[${notification.type}] ${notification.title} (Score: ${notification.score.toFixed(2)})`;
+}
+
+async function main() {
+  const studentId = '1042';
+  
+  const topNotifications = await getTopNotifications(studentId, 10);
+  
+  console.log('=== Priority Inbox ===\n');
+  topNotifications.forEach((notif, index) => {
+    console.log(`${index + 1}. ${formatNotificationForDisplay(notif)}`);
+    console.log(`   Message: ${notif.message}`);
+    console.log(`   Age: ${notif.ageHours.toFixed(1)} hours`);
+    console.log();
+  });
+}
+
+main().catch(console.error);
+```
+
+### Efficient Maintenance Strategy
+
+**Problem:** New notifications arrive constantly. Maintaining top 10 efficiently is critical.
+
+**Solution 1: Redis Sorted Set (Recommended)**
+
+```typescript
+import redis from 'redis';
+
+const client = redis.createClient();
+
+async function updatePriorityInbox(notification: Notification) {
+  const score = calculateScore(notification);
+  
+  const cacheKey = `priority_inbox:${notification.studentId}`;
+  
+  await client.zAdd(cacheKey, {
+    score: score,
+    value: notification.id
+  });
+  
+  const count = await client.zCard(cacheKey);
+  if (count > 10) {
+    await client.zRemRangeByRank(cacheKey, 0, count - 11);
+  }
+  
+  await client.expire(cacheKey, 3600);
+}
+
+async function getTopNotificationsFromCache(studentId: string): Promise<string[]> {
+  const cacheKey = `priority_inbox:${studentId}`;
+  
+  const notificationIds = await client.zRange(cacheKey, 0, 9, {
+    byScore: false,
+    rev: true
+  });
+  
+  return notificationIds;
+}
+```
+
+**Time Complexity:**
+- Add notification: O(log 10) = O(1)
+- Get top 10: O(log n + 10) = O(1)
+- Trim to 10: O(1)
+
+**Solution 2: Heap Data Structure (Alternative)**
+
+```typescript
+import PriorityQueue from 'js-priority-queue';
+
+class PriorityInbox {
+  private heap: PriorityQueue<ScoredNotification>;
+  private maxSize: number = 10;
+  
+  constructor() {
+    this.heap = new PriorityQueue({
+      comparator: (a, b) => b.score - a.score
+    });
+  }
+  
+  addNotification(notification: ScoredNotification) {
+    this.heap.queue(notification);
+    
+    if (this.heap.length > this.maxSize) {
+      this.heap.dequeue();
+    }
+  }
+  
+  getTop10(): ScoredNotification[] {
+    return [...this.heap.toArray()];
+  }
+}
+```
+
+**Time Complexity:**
+- Add: O(log 10) = O(1)
+- Get top: O(10) = O(1)
+
+### Score Recalculation
+
+**Problem:** As time passes, scores change. A notification from 1 week ago gets lower score.
+
+**Solution: Lazy Recalculation**
+
+```typescript
+async function getTopNotificationsWithRefresh(
+  studentId: string,
+  limit: number = 10
+): Promise<ScoredNotification[]> {
+  const cacheKey = `priority_inbox:${studentId}`;
+  
+  const cachedIds = await client.zRange(cacheKey, 0, -1, { rev: true });
+  
+  const notificationsData = await Promise.all(
+    cachedIds.map(id => getNotificationFromDB(id))
+  );
+  
+  const rescored = notificationsData.map(notif => ({
+    ...notif,
+    score: calculateScore(notif),
+    ageHours: calculateAge(notif.createdAt)
+  }));
+  
+  rescored.sort((a, b) => b.score - a.score);
+  
+  return rescored.slice(0, limit);
+}
+```
+
+**Frequency:** Recalculate every 1 hour or on user request (whichever is less frequent)
+
+### API Endpoint
+
+```typescript
+import express from 'express';
+
+const app = express();
+
+app.get('/api/v1/notifications/priority-inbox/:studentId', async (req, res) => {
+  try {
+    const { studentId } = req.params;
+    const limit = Math.min(parseInt(req.query.limit as string) || 10, 50);
+    
+    const topNotifications = await getTopNotificationsWithRefresh(studentId, limit);
+    
+    res.json({
+      statusCode: 200,
+      success: true,
+      data: {
+        totalCount: topNotifications.length,
+        notifications: topNotifications.map(notif => ({
+          id: notif.id,
+          title: notif.title,
+          message: notif.message,
+          type: notif.type,
+          score: parseFloat(notif.score.toFixed(2)),
+          ageHours: parseFloat(notif.ageHours.toFixed(1)),
+          createdAt: notif.createdAt
+        }))
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      statusCode: 500,
+      success: false,
+      error: (error as Error).message
+    });
+  }
+});
+
+app.listen(3000, () => {
+  console.log('Server running on port 3000');
+});
+```
+
+### Performance Summary
+
+| Operation | Time Complexity | Space Complexity |
+|-----------|-----------------|------------------|
+| Add notification | O(log 10) | O(10) |
+| Get top 10 | O(1) | O(1) |
+| Recalculate scores | O(10 log 10) | O(10) |
+| API response | ~50-100ms | ~2KB |
+
+**Expected Load:**
+- 50,000 students × 1 request/hour = 14 requests/second
+- With caching: ~5% cache miss rate = 0.7 DB queries/second
+- With Redis: <1ms per request
