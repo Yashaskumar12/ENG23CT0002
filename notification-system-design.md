@@ -1198,6 +1198,17 @@ CREATE TABLE notification_dead_letter_queue (
 
 **Requirement:** Display top 10 most important unread notifications based on weight and recency.
 
+**⚠️ Important:** The notification API endpoint requires an **Authorization** header:
+```
+Authorization: Bearer <YOUR_API_TOKEN>
+```
+
+**API Endpoint:** 
+```
+GET http://4.224.186.213/evaluation-service/notifications?studentId=1042
+Headers: Authorization: Bearer <YOUR_TOKEN>
+```
+
 **Priority Formula:**
 - **Placement:** Weight = 100
 - **Result:** Weight = 50
@@ -1207,7 +1218,19 @@ CREATE TABLE notification_dead_letter_queue (
 
 **Overall Score = Type Weight × (1 - (Age in Hours / 168))**
 
-The notification API endpoint: `http://4.224.186.213/evaluation-service/notifications`
+### Quick Start
+
+For **testing without authorization**, use the mock API:
+```bash
+node mock-api-server.js  # Start in terminal 1
+node fetch-and-rank-notifications.js  # Run in terminal 2
+```
+
+For **production with real API**, provide your token:
+```bash
+$env:API_TOKEN = "Bearer YOUR_TOKEN_HERE"
+node fetch-and-rank-notifications.js
+```
 
 ### Implementation (TypeScript)
 
