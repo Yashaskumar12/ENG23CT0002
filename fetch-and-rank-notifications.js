@@ -1,6 +1,13 @@
 const axios = require('axios');
 
-const API_URL = 'http://4.224.186.213/evaluation-service/notifications';
+// Use mock API for demo purposes
+// To use the real API: change USE_MOCK_API to false and provide AUTHORIZATION_TOKEN
+const USE_MOCK_API = true;
+const MOCK_API_URL = 'http://localhost:4000/evaluation-service/notifications';
+const REAL_API_URL = 'http://4.224.186.213/evaluation-service/notifications';
+const AUTHORIZATION_TOKEN = process.env.API_TOKEN || 'Bearer YOUR_TOKEN_HERE';
+
+const API_URL = USE_MOCK_API ? MOCK_API_URL : REAL_API_URL;
 
 const TYPE_WEIGHTS = {
   'Placement': 100,
@@ -26,17 +33,42 @@ async function fetchNotificationsFromAPI(studentId) {
   try {
     console.log(`📥 Fetching from: ${API_URL}?studentId=${studentId}`);
     
-    const response = await axios.get(API_URL, {
+    const config = {
       params: {
         studentId: studentId
       },
       timeout: 5000
-    });
+    };
+    
+    // Add authorization header
+    if (!USE_MOCK_API) {
+      config.headers = {
+        'Authorization': AUTHORIZATION_TOKEN
+      };
+      console.log(`   Using Authorization Header: ${AUTHORIZATION_TOKEN.substring(0, 20)}...`);
+    } else {
+      config.headers = {
+        'Authorization': 'Bearer mock-token-for-demo'
+      };
+    }
+    
+    const response = await axios.get(API_URL, config);
     
     console.log(`✓ Retrieved ${response.data.length || 0} notifications\n`);
     return response.data || [];
   } catch (error) {
-    console.error(`❌ Error fetching notifications: ${error.message}`);
+    if (error.response?.status === 401) {
+      console.error(`❌ Authorization Error: ${error.response.data.message}`);
+      console.error(`\n💡 HINT: The API requires an Authorization header!`);
+      console.error(`   Set your token: export API_TOKEN="Bearer YOUR_TOKEN_HERE"`);
+    } else if (error.code === 'ECONNREFUSED') {
+      console.error(`❌ Connection Error: Cannot reach ${API_URL}`);
+      console.error(`\n💡 HINT: To use mock data for testing:`);
+      console.error(`   1. Start mock server: node mock-api-server.js`);
+      console.error(`   2. Run this script: node fetch-and-rank-notifications.js`);
+    } else {
+      console.error(`❌ Error fetching notifications: ${error.message}`);
+    }
     return [];
   }
 }
