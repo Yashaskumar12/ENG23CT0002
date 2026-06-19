@@ -1059,7 +1059,6 @@ function initiateBulkNotification(studentIds, message) {
 function processNotificationJob(jobId, studentIds, message) {
   for (const studentId of studentIds) {
     const notificationId = generateUniqueId();
-    
     enqueueTask({
       jobId: jobId,
       notificationId: notificationId,
@@ -1453,6 +1452,108 @@ app.get('/api/v1/notifications/priority-inbox/:studentId', async (req, res) => {
 app.listen(3000, () => {
   console.log('Server running on port 3000');
 });
+```
+
+### Using the Provided Notification API
+
+**External API Endpoint:**
+```
+GET http://4.224.186.213/evaluation-service/notifications
+```
+
+**Note:** You are provided with this API endpoint to fetch notifications. Do NOT store them in a database or create notifications yourself. Simply fetch from this API, calculate priorities, and display them.
+
+#### Step 1: Fetch Notifications from API
+
+```typescript
+import axios from 'axios';
+
+const API_URL = 'http://4.224.186.213/evaluation-service/notifications';
+
+async function fetchNotificationsFromAPI(studentId: string): Promise<Notification[]> {
+  try {
+    const response = await axios.get(API_URL, {
+      params: {
+        studentId: studentId
+      },
+      timeout: 5000
+    });
+    
+    return response.data;
+  } catch (error) {
+    console.error('Error fetching notifications from API:', error);
+    return [];
+  }
+}
+```
+
+#### Step 2: Calculate Priority Scores
+
+```typescript
+function scoredNotifications(notifications: Notification[]): ScoredNotification[] {
+  return notifications
+    .filter(n => !n.isRead)
+    .map(n => ({
+      ...n,
+      score: calculateScore(n),
+      ageHours: calculateAge(n.createdAt)
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10);
+}
+```
+
+#### Step 3: Return Prioritized Results
+
+```typescript
+async function getPriorityInbox(studentId: string): Promise<ScoredNotification[]> {
+  const notifications = await fetchNotificationsFromAPI(studentId);
+  return scoredNotifications(notifications);
+}
+```
+
+#### Full Integration Example
+
+```typescript
+async function displayPriorityInbox(studentId: string) {
+  console.log('Fetching notifications from: ' + API_URL);
+  
+  const notifications = await fetchNotificationsFromAPI(studentId);
+  console.log(`Retrieved ${notifications.length} notifications`);
+  
+  const topPriority = notifications
+    .filter(n => !n.isRead)
+    .map(n => ({
+      ...n,
+      score: calculateScore(n),
+      ageHours: calculateAge(n.createdAt),
+      weight: TYPE_WEIGHTS[n.type] || 0
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10);
+  
+  console.log('\n=== Priority Inbox (Top 10) ===\n');
+  
+  topPriority.forEach((notif, i) => {
+    console.log(`${i + 1}. [${notif.type}] ${notif.title}`);
+    console.log(`   Weight: ${notif.weight} | Score: ${notif.score.toFixed(3)}`);
+    console.log(`   Message: ${notif.message}`);
+    console.log(`   Age: ${notif.ageHours.toFixed(1)} hours\n`);
+  });
+  
+  return topPriority;
+}
+```
+
+#### API Testing in Postman
+
+```
+1. Create GET request
+2. URL: http://4.224.186.213/evaluation-service/notifications
+3. Query Parameter: studentId=1042
+4. Send request
+5. Response contains array of notifications
+6. Your application processes and ranks them
 ```
 
 ### Performance Summary
